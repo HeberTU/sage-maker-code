@@ -1,0 +1,266 @@
+trigger:
+- main
+
+pr:
+  branches:
+    include:
+    - main
+    - feat/*
+
+resources:
+- repo: self
+
+variables:
+  - group: aws-registry-dev
+  - group: aws-explore-dev
+
+  - name: projectName
+    value: 'Fraud'
+
+  - name: tag
+    value: '$(Build.BuildId)'
+
+  - name: fileName
+    value: 'raw_data.pickle'
+
+
+stages:
+- stage: Build
+  displayName: Build and Push Docker Image
+  jobs:
+  - job: BuildAndPush
+    displayName: Build and Push
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - bash: |
+        echo "##vso[task.setvariable variable=gitSha;isOutput=true]$(echo "$(Build.SourceVersion)" | cut -c 1-8)"
+        echo "##vso[task.setvariable variable=ecrRepository;isOutput=true]$(echo "${projectName,,}-ecr-repo")"
+      name: setSha
+      env:
+        projectName: $(projectName)
+      displayName: Set gitSha Variable
+    - bash: |
+        wget https://rolesanywhere.amazonaws.com/releases/1.0.3/X86_64/Linux/aws_signing_helper
+        chmod +x aws_signing_helper
+      displayName: Install AWS Signer
+
+    - task: DownloadSecureFile@1
+      name: Certificate
+      displayName: 'Download certificate'
+      inputs:
+        secureFile: 'zurich.com.crt'
+
+    - task: DownloadSecureFile@1
+      name: Privatekey
+      displayName: 'Download private key'
+      inputs:
+        secureFile: 'private.key'
+
+    - bash: |
+        mkdir -p /home/vsts/.aws
+        echo '[default]' > /home/vsts/.aws/credentials
+        ./aws_signing_helper credential-process \
+        --certificate $(Certificate.secureFilePath) \
+        --private-key $(Privatekey.secureFilePath) \
+        --trust-anchor-arn $(trustAnchorArnRegistry) \
+        --profile-arn $(profileArnRegistry) \
+        --role-arn $(roleArnRegistry) \
+        >> /home/vsts/.aws/credentials
+        echo '[default]' > /home/vsts/.aws/config
+        echo 'credential_process = ./aws_signing_helper credential-process --certificate $(Certificate.secureFilePath) --private-key $(Privatekey.secureFilePath) --trust-anchor-arn $(trustAnchorArnRegistry) --profile-arn $(profileArnRegistry) --role-arn $(roleArnRegistry)' >> /home/vsts/.aws/config
+        echo 'region = $(awsRegionRegistry)' >> /home/vsts/.aws/config
+      displayName: Obtain AWS Credentials
+
+    - bash: |
+        AWS_PROFILE=default aws ecr get-login-password --region $(awsRegionRegistry) | docker login --username AWS --password-stdin $(ecrRegistry)
+      displayName: Log in to ECR
+
+    - task: Docker@2
+      displayName: Build an image
+      inputs:
+        repository: '$(ecrRegistry)/$(setSha.ecrRepository)'
+        command: build
+        dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+        tags: |
+          $(setSha.gitSha)
+          latest
+
+    - task: Docker@2
+      displayName: Push an image
+      inputs:
+        repository: '$(ecrRegistry)/$(setSha.ecrRepository)'
+        command: push
+        tags: |
+          $(setSha.gitSha)
+          latest
+
+- stage: Train
+  displayName: Train ML Model
+  dependsOn: Build
+  jobs:
+  - job: TrainModel
+    displayName: Train Model on SageMaker
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - bash: |
+        echo "##vso[task.setvariable variable=gitSha;isOutput=true]$(echo "$(Build.SourceVersion)" | cut -c 1-8)"
+        echo "##vso[task.setvariable variable=ecrRepository;isOutput=true]$(echo "${projectName,,}-ecr-repo")"
+      name: setSha
+      env:
+        projectName: $(projectName)
+      displayName: Set gitSha Variable
+    - bash: |
+        wget https://rolesanywhere.amazonaws.com/releases/1.0.3/X86_64/Linux/aws_signing_helper
+        chmod +x aws_signing_helper
+      displayName: Install AWS Signer
+
+    - task: DownloadSecureFile@1
+      name: Certificate
+      displayName: 'Download certificate for training'
+      inputs:
+        secureFile: 'zurich.com.crt'
+
+    - task: DownloadSecureFile@1
+      name: Privatekey
+      displayName: 'Download private key for training'
+      inputs:
+        secureFile: 'private.key'
+
+    - bash: |
+        mkdir -p /home/vsts/.aws
+        echo '[default]' > /home/vsts/.aws/credentials
+        ./aws_signing_helper credential-process \
+        --certificate $(Certificate.secureFilePath) \
+        --private-key $(Privatekey.secureFilePath) \
+        --trust-anchor-arn $(trustAnchorArnExp) \
+        --profile-arn $(profileArnExp) \
+        --role-arn $(roleArnExp) \
+        >> /home/vsts/.aws/credentials
+        echo '[default]' > /home/vsts/.aws/config
+        echo 'credential_process = ./aws_signing_helper credential-process --certificate $(Certificate.secureFilePath) --private-key $(Privatekey.secureFilePath) --trust-anchor-arn $(trustAnchorArnExp) --profile-arn $(profileArnExp) --role-arn $(roleArnExp)' >> /home/vsts/.aws/config
+        echo 'region = $(awsRegionExp)' >> /home/vsts/.aws/config
+      displayName: Obtain AWS Credentials for Exploration
+
+    - bash: |
+        inputS3Uri=$(s3TrainUri)$(projectName)/$(fileName)
+        outputBucket=$(s3ArtifactUriExp)$(projectName)/
+        trainingName=$(projectName)-$(setSha.gitSha)
+        ecrContainerUrl=$(ecrRegistry)/$(setSha.ecrRepository):$(setSha.gitSha)
+        echo "eCR Container is is $ecrContainerUrl"
+        echo "Training name is $trainingName"
+        
+        aws sagemaker create-training-job \
+          --training-job-name $trainingName \
+          --algorithm-specification TrainingImage=$ecrContainerUrl,TrainingInputMode=File \
+          --role-arn $(sagemakerRoleExp) \
+          --input-data-config '[{"ChannelName":"train","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"'$inputS3Uri'","S3DataDistributionType":"FullyReplicated"}},"ContentType":"text/csv","CompressionType":"None"}]' \
+          --output-data-config '{"S3OutputPath":"'$outputBucket'","KmsKeyId":"$(kmsArnExp)"}' \
+          --resource-config '{"InstanceType":"ml.m4.xlarge","InstanceCount":1,"VolumeSizeInGB":8}' \
+          --stopping-condition '{"MaxRuntimeInSeconds":43200}'
+      displayName: Run SageMaker Training
+      env:
+        AWS_DEFAULT_REGION: $(awsRegionExp)
+
+    - bash: |
+        trainingName=$(projectName)-$(setSha.gitSha)
+        echo "Training Name is $trainingName"
+        while true; do
+          status=$(aws sagemaker describe-training-job --training-job-name $trainingName --query 'TrainingJobStatus' --output text)
+          echo "Current status of the training job: $status"
+          if [[ "$status" == "Completed" ]]; then
+            echo "Training job completed successfully."
+            break
+          elif [[ "$status" == "Failed" ]]; then
+            echo "Training job failed."
+            exit 1
+          elif [[ "$status" == "" ]]; then
+            echo "No status returned. Possibly an incorrect training job name."
+            exit 1
+          else
+            echo "Training job is still $status. Waiting..."
+            sleep 10
+          fi
+        done
+      displayName: Check Training Job Status
+
+- stage: Package
+  displayName: Create new package model version
+  dependsOn: Train
+  jobs:
+  - job: PackageModel
+    displayName: Package Model
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - bash: |
+        echo "##vso[task.setvariable variable=gitSha;isOutput=true]$(echo "$(Build.SourceVersion)" | cut -c 1-8)"
+        echo "##vso[task.setvariable variable=ecrRepository;isOutput=true]$(echo "${projectName,,}-ecr-repo")"
+      name: setSha
+      env:
+        projectName: $(projectName)
+      displayName: Set gitSha Variable
+    - bash: |
+        wget https://rolesanywhere.amazonaws.com/releases/1.0.3/X86_64/Linux/aws_signing_helper
+        chmod +x aws_signing_helper
+      displayName: Install AWS Signer
+
+    - task: DownloadSecureFile@1
+      name: Certificate
+      displayName: 'Download certificate for training'
+      inputs:
+        secureFile: 'zurich.com.crt'
+
+    - task: DownloadSecureFile@1
+      name: Privatekey
+      displayName: 'Download private key for training'
+      inputs:
+        secureFile: 'private.key'
+
+    - bash: |
+        mkdir -p /home/vsts/.aws
+        echo '[default]' > /home/vsts/.aws/credentials
+        ./aws_signing_helper credential-process \
+        --certificate $(Certificate.secureFilePath) \
+        --private-key $(Privatekey.secureFilePath) \
+        --trust-anchor-arn $(trustAnchorArnRegistry) \
+        --profile-arn $(profileArnRegistry) \
+        --role-arn $(roleArnRegistry) \
+        >> /home/vsts/.aws/credentials
+        echo '[default]' > /home/vsts/.aws/config
+        echo 'credential_process = ./aws_signing_helper credential-process --certificate $(Certificate.secureFilePath) --private-key $(Privatekey.secureFilePath) --trust-anchor-arn $(trustAnchorArnRegistry) --profile-arn $(profileArnRegistry) --role-arn $(roleArnRegistry)' >> /home/vsts/.aws/config
+        echo 'region = $(awsRegionRegistry)' >> /home/vsts/.aws/config
+      displayName: Obtain AWS Credentials
+    - bash: |
+        fromBucket=$(s3ArtifactUriExp)$(projectName)/$(projectName)-$(setSha.gitSha)/output/model.tar.gz
+        toBucket=$(s3ArtifactUriRegistry)$(projectName)/$(projectName)-$(setSha.gitSha)/output/model.tar.gz
+        kms_arn=$(KMSArnRegistry)
+      
+        aws s3 cp "$fromBucket" "$toBucket" --sse aws:kms --sse-kms-key-id "$kms_arn"
+      displayName: Copy model artifacts to Registry
+      env:
+        AWS_DEFAULT_REGION: $(awsRegionRegistry)
+    - bash: |
+        modelPackageGroupName="fraud-model-package-group"
+        outputBucket=$(s3ArtifactUriRegistry)$(projectName)/$(projectName)-$(setSha.gitSha)/output/model.tar.gz
+        ecrContainerUrl=$(ecrRegistry)/$(setSha.ecrRepository):$(setSha.gitSha)
+        supportedContentTypes='["text/csv"]'  
+        supportedResponseTypes='["application/json"]'
+        
+        echo "outputBucket: $outputBucket"
+        echo "ecrContainerUrl: $ecrContainerUrl"
+        
+
+        model_package_arn=$(aws sagemaker create-model-package \
+          --model-package-group-name "$modelPackageGroupName" \
+          --model-package-description "Package version created from commit $gitSha" \
+          --model-approval-status "Approved" \
+          --inference-specification "{\"Containers\":[{\"Image\":\"$ecrContainerUrl\",\"ModelDataUrl\":\"$outputBucket\"}],\"SupportedContentTypes\":$supportedContentTypes,\"SupportedResponseMIMETypes\":$supportedResponseTypes}" \
+          --query 'ModelPackageArn' \
+          --output text)
+        echo "model package arn: $model_package_arn"
+
+      displayName: Register New Model Package Version
+      env:
+        AWS_DEFAULT_REGION: $(awsRegionRegistry)

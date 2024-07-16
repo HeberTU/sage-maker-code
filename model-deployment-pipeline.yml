@@ -1,0 +1,106 @@
+trigger: none  # Disables CI trigger
+pr: none      # Disables PR trigger
+
+parameters:
+- name: ModelPackageARN
+  displayName: 'Model Package ARN'
+  type: string
+
+resources:
+- repo: self
+
+variables:
+  - group: aws-registry-dev
+  - group: aws-deploy-dev
+
+  - name: projectName
+    value: 'Fraud'
+
+
+stages:
+- stage: Deployment
+  displayName: Deploy Model to Production
+  jobs:
+  - job: ModelDeployment
+    displayName: Model Deployment
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - bash: |
+        echo "##vso[task.setvariable variable=gitSha;isOutput=true]$(echo "$(Build.SourceVersion)" | cut -c 1-8)"
+      name: setSha
+      displayName: Set gitSha Variable
+
+    - bash: |
+        wget https://rolesanywhere.amazonaws.com/releases/1.0.3/X86_64/Linux/aws_signing_helper
+        chmod +x aws_signing_helper
+      displayName: Install AWS Signer
+
+    - task: DownloadSecureFile@1
+      name: Certificate
+      displayName: 'Download certificate for training'
+      inputs:
+        secureFile: 'zurich.com.crt'
+
+    - task: DownloadSecureFile@1
+      name: Privatekey
+      displayName: 'Download private key for training'
+      inputs:
+        secureFile: 'private.key'
+
+    - bash: |
+        mkdir -p /home/vsts/.aws
+        echo '[default]' > /home/vsts/.aws/credentials
+        ./aws_signing_helper credential-process \
+        --certificate $(Certificate.secureFilePath) \
+        --private-key $(Privatekey.secureFilePath) \
+        --trust-anchor-arn $(trustAnchorArnDeploy) \
+        --profile-arn $(profileArnDeploy) \
+        --role-arn $(roleArnDeploy) \
+        >> /home/vsts/.aws/credentials
+        echo '[default]' > /home/vsts/.aws/config
+        echo 'credential_process = ./aws_signing_helper credential-process --certificate $(Certificate.secureFilePath) --private-key $(Privatekey.secureFilePath) --trust-anchor-arn $(trustAnchorArnDeploy) --profile-arn $(profileArnDeploy) --role-arn $(roleArnDeploy)' >> /home/vsts/.aws/config
+        echo 'region = $(awsRegionDeploy)' >> /home/vsts/.aws/config
+      displayName: Obtain AWS Credentials
+
+    - bash: |
+        echo "Deploying ${{ parameters.ModelPackageARN }}"
+        model_name="$(projectName)-$(setSha.gitSha)"
+        model_package_arn=${{ parameters.ModelPackageARN }}
+
+        aws sagemaker create-model \
+          --model-name $model_name \
+          --execution-role-arn $(sagemakerRoleDeploy) \
+          --containers ModelPackageName=$model_package_arn
+      
+        endpoint_config_name="endpoint-config-$(projectName)-$(setSha.gitSha)"
+
+        aws sagemaker create-endpoint-config \
+            --endpoint-config-name $endpoint_config_name \
+            --production-variants '[{
+                "InstanceType": "ml.c5.xlarge",
+                "InitialVariantWeight": 1,
+                "InitialInstanceCount": 1,
+                "ModelName": "'$model_name'",
+                "VariantName": "AllTraffic"
+            }]'
+
+        endpoint_name="endpoint-$(projectName)"
+
+        endpoint_exists=$(aws sagemaker describe-endpoint --endpoint-name $endpoint_name 2>&1)
+
+        if echo "$endpoint_exists" | grep -q 'Could not find'; then
+          echo "Endpoint does not exist, creating..."
+          aws sagemaker create-endpoint \
+              --endpoint-name $endpoint_name \
+              --endpoint-config-name $endpoint_config_name
+        else
+          echo "Endpoint exists, updating..."
+          aws sagemaker update-endpoint \
+              --endpoint-name $endpoint_name \
+              --endpoint-config-name $endpoint_config_name
+        fi
+
+      displayName: Deploying Model
+      env:
+        AWS_DEFAULT_REGION: $(awsRegionDeploy)

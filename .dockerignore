@@ -1,0 +1,7 @@
+.venv
+.cachedir
+assets
+data
+logs
+input
+./azure-pipelines.yml
